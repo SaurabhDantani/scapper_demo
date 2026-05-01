@@ -2,6 +2,29 @@ import { chromium, Browser, Page } from 'playwright';
 import { IPOData } from '../utils/interface.js';
 import Tesseract from 'tesseract.js';
 
+function solveMathCaptcha(text: string): string {
+  try {
+    // Extract only the math equation part before '=' or '?'
+    let mathPart = (text.split('=')[0] || '').split('?')[0] || '';
+
+    // Replace 'x' or 'X' with '*' for multiplication, then keep only numbers and math operators
+    let cleanStr = mathPart.replace(/[xX]/g, '*').replace(/[^0-9\+\-\*\/]/g, '');
+    
+    // Remove any trailing math operators that might have been accidentally parsed
+    cleanStr = cleanStr.replace(/[\+\-\*\/]+$/, '');
+
+    if (!cleanStr) {
+      // fallback if no math operators found or it's empty
+      return text.replace(/[^A-Za-z0-9]/g, '').trim(); 
+    }
+    const result = new Function('return ' + cleanStr)();
+    return Math.round(Number(result)).toString();
+  } catch (e) {
+    console.error(`[Integrated] Math captcha parsing failed for '${text}', falling back to clean text.`);
+    return text.replace(/[^A-Za-z0-9]/g, '').trim();
+  }
+}
+
 export class IntegratedScraper {
   private browser: Browser | null = null;
   private page: Page | null = null;
@@ -50,16 +73,20 @@ export class IntegratedScraper {
       );
 
       if (matchedOption && matchedOption.value !== '0') {
+        console.log(`[Integrated] Selected Company: ${matchedOption.text} (Value: ${matchedOption.value})`);
         await this.page.selectOption('#CompDdl2', { value: matchedOption.value });
       } else {
         console.log(`[Integrated] Company '${data.companyName}' not found. Falling back to the first available company.`);
+        console.log(`[Integrated] Selected Company: Index 1`);
         await this.page.selectOption('#CompDdl2', { index: 1 });
       }
 
       // Select PAN Number Choice (value "3")
+      console.log(`[Integrated] Selected Pancard Type Choice: '3' (PAN Number)`);
       await this.page.selectOption('#ChoiceDdl2', { value: '3' });
-
+      
       // Fill PAN Number
+      console.log(`[Integrated] Filled PAN Number: ${data.panNumber}`);
       await this.page.fill('#Pan_txt2', data.panNumber);
 
       let attempt = 0;
@@ -74,12 +101,15 @@ export class IntegratedScraper {
         if (!captchaElement) throw new Error('Captcha image not found');
 
         const captchaBuffer = await captchaElement.screenshot();
-        
-        const { data: { text } } = await Tesseract.recognize(captchaBuffer, 'eng');
-        const cleanCaptcha = text.replace(/[^A-Za-z0-9]/g, '').trim();
-        console.log(`[Integrated] Extracted captcha: ${cleanCaptcha}`);
 
-        await this.page.fill('#Captcha_Txt', cleanCaptcha);
+        const { data: { text } } = await Tesseract.recognize(captchaBuffer, 'eng');
+        const rawCaptcha = text.trim();
+        console.log(`[Integrated] Extracted raw captcha text: '${rawCaptcha}'`);
+        
+        const solvedCaptcha = solveMathCaptcha(rawCaptcha);
+        console.log(`[Integrated] Filled solved captcha: ${solvedCaptcha}`);
+
+        await this.page.fill('#Captcha_Txt', solvedCaptcha);
 
         let alertMessage = '';
         const dialogHandler = async (dialog: any) => {
@@ -90,14 +120,14 @@ export class IntegratedScraper {
 
         // Submit
         await this.page.click('#NCD_sub_btn2');
-        
+
         await this.page.waitForTimeout(2000); // Wait for alert or result page
         this.page.off('dialog', dialogHandler);
 
         if (alertMessage && alertMessage.toLowerCase().includes('captcha')) {
           console.log(`[Integrated] Captcha incorrect: ${alertMessage}. Retrying...`);
           // Click the refresh button
-          await this.page.click('.CaptchaReloadImg').catch(() => {});
+          await this.page.click('.CaptchaReloadImg').catch(() => { });
           await this.page.waitForTimeout(1000);
         } else if (alertMessage) {
           console.log(`[Integrated] Alert received: ${alertMessage}`);
@@ -106,12 +136,25 @@ export class IntegratedScraper {
         } else {
           console.log('[Integrated] Captcha accepted (or no alert appeared).');
           success = true;
-          
-          // Optionally extract result from page if it navigates or shows a div
-          const resultDiv = await this.page.$('#LinkID');
-          if (resultDiv) {
-             resultMessage = 'Allotment status retrieved successfully (check page for details).';
+
+          // Extract result from page based on #inputdiv3
+          const inputDiv3 = await this.page.$('#inputdiv3');
+          if (inputDiv3) {
+            const text = await inputDiv3.innerText();
+            if (text.trim()) {
+              resultMessage = text.trim();
+            }
           }
+
+          // Fallback check if it was a successful allotment with a different div
+          if (resultMessage === 'Data submitted successfully') {
+            const resultDiv = await this.page.$('#LinkID');
+            if (resultDiv) {
+              resultMessage = 'Allotment status retrieved successfully (check page for details).';
+            }
+          }
+
+          console.log(`[Integrated] Result for ${data.panNumber}: ${resultMessage}`);
         }
       }
 
